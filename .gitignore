@@ -2,3 +2,5 @@
 models/
 __pycache__/
 .env
+tcl_t9/manifests/
+tcl_t9/runs/
