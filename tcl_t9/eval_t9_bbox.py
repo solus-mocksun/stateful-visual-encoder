@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
+"""Single-process eval (no torch.distributed/NCCL) so it can run on one GPU
+or CPU when the box's GPUs are contended by other jobs. Slower than a
+multi-GPU run, but doesn't require exclusive access to hardware."""
 import argparse
 import json
-import os
 import re
+import time
 from pathlib import Path
 
 import torch
-import torch.distributed as dist
 from PIL import Image
 from transformers import AutoModelForImageTextToText, AutoProcessor
 
@@ -67,9 +69,11 @@ def parse_boxes(text):
     text = text.strip()
     if not text or 'no obvious defect' in text.lower():
         return []
-    for candidate in (text, (_BBOX_ARRAY_RE.search(text) or [None])[0] if _BBOX_ARRAY_RE.search(text) else None):
-        if candidate is None:
-            continue
+    candidates = [text]
+    m = _BBOX_ARRAY_RE.search(text)
+    if m:
+        candidates.append(m.group(0))
+    for candidate in candidates:
         try:
             data = json.loads(candidate)
             if isinstance(data, list):
@@ -142,6 +146,7 @@ def summarize(results, iou_threshold, out_dir):
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     (Path(out_dir) / 'metrics.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
     print(json.dumps(summary, indent=2))
+    return summary
 
 
 def main():
@@ -150,46 +155,44 @@ def main():
     ap.add_argument('--checkpoint', required=True, help='trainable_state.pt from training')
     ap.add_argument('--test_jsonl', required=True)
     ap.add_argument('--output_dir', required=True)
+    ap.add_argument('--device', default='auto', help='"auto", "cuda", "cuda:1", or "cpu"')
     ap.add_argument('--iou_threshold', type=float, default=0.5)
     ap.add_argument('--max_pixels', type=int, default=589824)
     ap.add_argument('--max_new_tokens', type=int, default=128)
     ap.add_argument('--limit', type=int, default=0)
+    ap.add_argument('--log_every', type=int, default=20)
     args = ap.parse_args()
 
-    dist.init_process_group('nccl')
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    local_rank = int(os.environ.get('LOCAL_RANK', rank))
-    torch.cuda.set_device(local_rank)
-    device = torch.device('cuda', local_rank)
+    if args.device == 'auto':
+        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    else:
+        device = torch.device(args.device)
+    dtype = torch.bfloat16 if device.type == 'cuda' else torch.float32
+    print(f'[device] {device} dtype={dtype}', flush=True)
 
     processor = AutoProcessor.from_pretrained(args.model_path, trust_remote_code=True)
     if processor.tokenizer.pad_token_id is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
+    print('[load] model', flush=True)
     model = AutoModelForImageTextToText.from_pretrained(
-        args.model_path, dtype=torch.bfloat16, trust_remote_code=True,
+        args.model_path, dtype=dtype, trust_remote_code=True,
     ).to(device)
     inject_sve(model, proj_init_std=0.0)
     state = torch.load(args.checkpoint, map_location=device)
     _, unexpected = model.load_state_dict(state, strict=False)
-    if rank == 0:
-        print(f'[load] checkpoint={args.checkpoint} loaded_tensors={len(state)} unexpected={len(unexpected)}', flush=True)
+    print(f'[load] checkpoint={args.checkpoint} loaded_tensors={len(state)} unexpected={len(unexpected)}', flush=True)
     model.eval()
 
     rows = read_jsonl(args.test_jsonl, args.limit or None)
-    if rank == 0:
-        print(f'[data] test={len(rows)}', flush=True)
+    print(f'[data] test={len(rows)}', flush=True)
 
     out_dir = Path(args.output_dir)
-    if rank == 0:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    dist.barrier()
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     results = []
-    shard = list(range(rank, len(rows), world_size))
-    for n, i in enumerate(shard):
-        sample = rows[i]
+    start = time.time()
+    for i, sample in enumerate(rows):
         gt_boxes = parse_boxes(sample['messages'][-1]['content']) or []
         pred_text = generate_answer(model, processor, sample, device, args.max_pixels, args.max_new_tokens)
         pred_boxes = parse_boxes(pred_text)
@@ -202,22 +205,17 @@ def main():
             'pred_boxes': pred_boxes,
             'iou': best_iou(pred_boxes, gt_boxes),
         })
-        if rank == 0 and n % 20 == 0:
-            print(f'[eval] {n}/{len(shard)} (this rank)', flush=True)
+        if i % args.log_every == 0:
+            elapsed = time.time() - start
+            rate = (i + 1) / elapsed if elapsed > 0 else 0
+            eta_min = (len(rows) - i - 1) / rate / 60 if rate > 0 else float('nan')
+            print(f'[eval] {i}/{len(rows)} elapsed_min={elapsed/60:.1f} eta_min={eta_min:.1f}', flush=True)
 
-    rank_path = out_dir / f'preds_rank{rank}.jsonl'
-    with rank_path.open('w', encoding='utf-8') as f:
+    with (out_dir / 'preds.jsonl').open('w', encoding='utf-8') as f:
         for r in results:
             f.write(json.dumps(r, ensure_ascii=False) + '\n')
-    dist.barrier()
 
-    if rank == 0:
-        all_results = []
-        for p in sorted(out_dir.glob('preds_rank*.jsonl')):
-            all_results.extend(read_jsonl(p))
-        summarize(all_results, args.iou_threshold, out_dir)
-
-    dist.destroy_process_group()
+    summarize(results, args.iou_threshold, out_dir)
 
 
 if __name__ == '__main__':
