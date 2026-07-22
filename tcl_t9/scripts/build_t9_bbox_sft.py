@@ -26,12 +26,18 @@ def norm_bbox(box, w, h):
         max(0, min(1000, round(y2 / h * 1000))),
     ]
 
-def bbox_from_labelme(path):
+def bbox_from_labelme(path, image_path=None):
     try:
         obj = json.loads(path.read_text(encoding="utf-8"))
     except Exception as e:
         return None, None, f"bad_json:{type(e).__name__}"
     w, h = obj.get("imageWidth"), obj.get("imageHeight")
+    if (not w or not h) and image_path is not None:
+        try:
+            with Image.open(image_path) as im:
+                w, h = im.size
+        except Exception:
+            pass
     if not w or not h:
         return None, None, "missing_image_size"
     xs, ys = [], []
@@ -133,7 +139,7 @@ def collect(root, verify_images=True):
                     stats["defect_missing_template"] += 1
                     add_skip(skipped, product, "with_defects", stem, "missing_template", image)
                     continue
-                bbox, size, err = bbox_from_labelme(jp)
+                bbox, size, err = bbox_from_labelme(jp, image)
                 if bbox is None:
                     stats[f"defect_bad_label:{err}"] += 1
                     add_skip(skipped, product, "with_defects", stem, err, jp)
