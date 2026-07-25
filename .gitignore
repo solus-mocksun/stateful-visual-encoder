@@ -4,3 +4,8 @@ __pycache__/
 .env
 tcl_t9/manifests/
 tcl_t9/runs/
+tcl_t9/diagnostics/
+tcl_t9/test_full_shards8/
+tcl_t9/test_full_shards8_chang_from_data/
+main.py
+.claude/settings.local.json
