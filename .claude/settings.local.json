@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git check-ignore *)",
+      "Bash(.venv/bin/python -c ' *)",
+      "Bash(.venv/bin/python -c \"import sve; print\\(sve.__file__\\)\")",
+      "Bash(textutil *)",
+      "Bash(git fetch *)",
+      "WebFetch(domain:www.notion.so)",
+      "WebFetch(domain:app.notion.com)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(git commit -m 'Rewrite eval script as single-process \\(drop torch.distributed/NCCL\\) *)"
+    ]
+  }
+}
